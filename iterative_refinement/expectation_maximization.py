@@ -18,7 +18,7 @@ import numpy as np
 from compSPI.transforms import do_fft, do_ifft # currently only 2D ffts in compSPI.transforms. can use torch.fft for 3d fft and convert back to numpy array
 
 
-def do_iterative_refinement(map_3d_init, particles):
+def do_iterative_refinement(map_3d_init, particles, ctf_info):
     """
     Performs interative refimenent in a Bayesean expectation maximization setting,
     i.e. maximum a posteriori estimation.
@@ -55,12 +55,39 @@ def do_iterative_refinement(map_3d_init, particles):
 
     # split particles up into two half sets for statistical validation
 
-    def do_split(particles):
-        idx_half = particles.shape[0] // 2
-        particles_1, particles_2 = particles[:idx_half], particles[idx_half:]
-        return particles_1, particles_2
+    def do_split(arr):
+        idx_half = arr.shape[0] // 2
+        arr_1, arr_2 = arr[:idx_half], arr[idx_half:]
+        assert arr_1.shape[0] == arr_2.shape[0]
+        return parr_1, arr_2
 
     particles_1, particles_2 = do_split(particles)
+
+    def do_build_ctf(ctf_params):
+        """
+        Build 2D array of ctf from ctf params
+
+        Input
+        ___
+        Params of ctfs (defocus, etc)
+            Suggest list of dicts, one for each particle.
+
+        Returns
+        ___
+        ctfs
+            type np.ndarray
+            shape (n_ctfs,n_pix,n_pix)
+
+        """
+        n_ctfs = len(ctf_params)
+        # TODO: see simSPI.transfer
+        # https://github.com/compSPI/simSPI/blob/master/simSPI/transfer.py#L57
+        ctfs = np.ones((n_ctfs,n_pix,n_pix))
+
+        return ctfs
+
+    ctfs = do_build_ctf(ctf_info)
+    ctfs_1, ctfs_2 = do_split(ctfs)
 
     # work in Fourier space. so particles can stay in Fourier space the whole time. 
     # they are experimental measurements and are fixed in the algorithm
@@ -152,6 +179,18 @@ def do_iterative_refinement(map_3d_init, particles):
         slices_1, xyz_rotated = do_slices(half_map_3d_1_f,rots) # Here rots are the same for the half maps, but could be different in general
         slices_2, xyz_rotated = do_slices(half_map_3d_2_f,rots)
 
+
+        def do_conv_ctf(projection_f, ctf):
+            """
+            Apply CTF to projection
+            """
+
+            # TODO: vectorize and have shape match
+            projection_f_conv_ctf = ctf*projection_f
+            return 
+
+
+
         def do_bayesean_weights(particle, slices):
             """
             compute bayesean weights of particle to slice
@@ -189,11 +228,28 @@ def do_iterative_refinement(map_3d_init, particles):
         counts_3d_updated_1 = np.zeros_like(half_map_3d_r_1) # float/real
         counts_3d_updated_2 = np.zeros_like(half_map_3d_r_2) # float/real
 
-        for particle in particles:
-            bayes_factors_1 = do_bayesean_weights(particles_1_f, slices_1)
-            bayes_factors_2 = do_bayesean_weights(particles_2_f, slices_2)
+        for particle_idx in range(particles_1_f.shape[0]):
+            ctf_1 = ctfs_1[particle_idx]
+            ctf_2 = ctfs_2[particle_idx]
+            particle_f_1 = particles_f_1[particle_idx]
+            particle_f_2 = particles_f_2[particle_idx]
 
-            def do_insert_slice(slice_real,xyz,num_pix):
+            def do_wiener_filter(projection, ctf, small_number):
+                wfilter = ctf/(ctf*ctf+small_number)
+                projection_wfilter_f = projection*w_filter
+                return projection_wfilter_f
+
+
+            particle_f_deconv_1 = do_wiener_filter(particles_f_1, ctf_1)
+            particle_f_deconv_1 = do_wiener_filter(particles_f_1, ctf_1)
+
+            slices_conv_ctfs_1 = do_conv_ctf(slices_1, ctf_1) # all slices get convolved with the ctf for the particle
+            slices_conv_ctfs_2 = do_conv_ctf(slices_2, ctf_2)
+
+            bayes_factors_1 = do_bayesean_weights(particles_1_f[particle_idx], slices_conv_ctfs_1)
+            bayes_factors_2 = do_bayesean_weights(particles_2_f[particle_idx], slices_conv_ctfs_2)
+
+            def do_insert_slice(slice_real,xyz,n_pix):
                 """
                 Update map_3d_f_updated with values from slice. Requires interpolation of off grid 
                 see "Insert Fourier slices" in https://github.com/geoffwoollard/learn_cryoem_math/blob/master/nb/fourier_slice_2D_3D_with_trilinear.ipynb
@@ -220,26 +276,26 @@ def do_iterative_refinement(map_3d_init, particles):
 
                 """
 
-                volume_3d = np.zeros((num_pix,num_pix,num_pix))
+                volume_3d = np.zeros((n_pix,n_pix,n_pix))
                 # TODO: write insertion code. use linear interpolation (order of interpolation kernel) so not expensive. 
                 # nearest neightbors cheaper, but we can afford to do better than that
 
                 return inserted_slice_3d, count_3d
 
-            for one_slice_idx in range(slices_1.shape[0]):
-                xyz = xyz_rotated[one_slice_idx]
-                one_slice = slices[one_slice_idx]
-                inserted_slice_3d_r, count_3d_r = do_insert_slice(one_slice.real,xyz,volume_3d) # if this can be vectorized, can avoid loop over slices
-                inserted_slice_3d_i, count_3d_i = do_insert_slice(one_slice.imag,xyz,volume_3d) # if this can be vectorized, can avoid loop over slices
+
+            for one_slice_idx in range(bayes_factors_1.shape[0]):
+                xyz = xyz_rotated[one_slice_idx]               
+                inserted_slice_3d_r, count_3d_r = do_insert_slice(particle_f_deconv_1.real,xyz,volume_3d) # if this can be vectorized, can avoid loop over slices
+                inserted_slice_3d_i, count_3d_i = do_insert_slice(particle_f_deconv_1.imag,xyz,volume_3d) # if this can be vectorized, can avoid loop over slices
                 map_3d_f_updated_1 += inserted_slice_3d_r + 1j*inserted_slice_3d_i
                 counts_3d_updated_1 += count_3d_r + count_3d_i
             
-            for one_slice_idx in range(slices_2.shape[0]):
-                xyz = xyz_rotated[one_slice_idx]
-                one_slice = slices[one_slice_idx]
-                inserted_slice_3d, count_3d = do_insert_slice(one_slice,xyz,volume_3d) # if this can be vectorized, can avoid loop over slices
-                map_3d_f_updated_2 += inserted_slice_3d
-                counts_3d_updated_2 += count_3d
+            for one_slice_idx in range(bayes_factors_2.shape[0]):
+                xyz = xyz_rotated[one_slice_idx]               
+                inserted_slice_3d_r, count_3d_r = do_insert_slice(particle_f_deconv_2.real,xyz,volume_3d) # if this can be vectorized, can avoid loop over slices
+                inserted_slice_3d_i, count_3d_i = do_insert_slice(particle_f_deconv_2.imag,xyz,volume_3d) # if this can be vectorized, can avoid loop over slices
+                map_3d_f_updated_2 += inserted_slice_3d_r + 1j*inserted_slice_3d_i
+                counts_3d_updated_2 += count_3d_r + count_3d_i
 
 
         # apply noise model
@@ -256,16 +312,16 @@ def do_iterative_refinement(map_3d_init, particles):
                 # https://github.com/geoffwoollard/learn_cryoem_math/blob/master/nb/fsc.ipynb
                 # https://github.com/geoffwoollard/learn_cryoem_math/blob/master/nb/mFSC.ipynb
                 # https://github.com/geoffwoollard/learn_cryoem_math/blob/master/nb/guinier_fsc_sharpen.ipynb
-            num_pix = map_3d_f_1.shape[0]
-            fsc_1d = np.ones(num_pix//2) 
+            n_pix = map_3d_f_1.shape[0]
+            fsc_1d = np.ones(n_pix//2) 
             return noise_estimate
 
 
         fsc_1d = do_estimate_noise(map_3d_f_updated_1,map_3d_f_updated_2)
 
         def do_expand_1d_3d(arr_1d):
-            num_pix = arr_1d.shape[0]*2
-            arr_3d = np.ones((num_pix,num_pix,num_pix)) 
+            n_pix = arr_1d.shape[0]*2
+            arr_3d = np.ones((n_pix,n_pix,n_pix)) 
             # TODO: arr_1d fsc_1d to 3d (spherical shells)
             return arr_3d
 
